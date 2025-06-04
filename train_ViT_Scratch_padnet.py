@@ -13,6 +13,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import numpy as np
+import random
 
 import torchvision
 import torchvision.transforms as transforms
@@ -23,6 +24,11 @@ import pandas as pd
 import csv
 import time
 import json
+import pickle
+import cv2
+from art.attacks.evasion import ProjectedGradientDescent, CarliniLInfMethod
+from art.estimators.classification import PyTorchClassifier
+from sklearn.metrics import accuracy_score
 
 from models import *
 from utils import progress_bar
@@ -30,6 +36,58 @@ from randomaug import RandAugment
 from models.vit import ViT
 from models.convmixer import ConvMixer
 from models.mobilevit import mobilevit_xxs
+
+
+# Add after the imports
+class SAM(torch.optim.Optimizer):
+    def __init__(self, params, base_optimizer, rho=0.05, **kwargs):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+        defaults = dict(rho=rho, **kwargs)
+        super(SAM, self).__init__(params, defaults)
+        self.base_optimizer = base_optimizer
+        self.param_groups = self.base_optimizer.param_groups
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group["rho"] / (grad_norm + 1e-12)
+            for p in group["params"]:
+                if p.grad is None: continue
+                self.state[p]["old_p"] = p.data.clone()
+                e_w = p.grad * scale.to(p)
+                p.add_(e_w)
+        if zero_grad: self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None: continue
+                p.data = self.state[p]["old_p"]
+        self.base_optimizer.step()
+        if zero_grad: self.zero_grad()
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        assert closure is not None, "Sharpness Aware Minimization requires closure"
+        closure = torch.enable_grad()(closure)
+        self.first_step(zero_grad=True)
+        closure()
+        self.second_step()
+
+    def _grad_norm(self):
+        shared_device = self.param_groups[0]["params"][0].device
+        norm = torch.norm(
+            torch.stack([
+                p.grad.norm(p=2).to(shared_device)
+                for group in self.param_groups for p in group["params"]
+                if p.grad is not None
+            ]),
+            p=2
+        )
+        return norm
+    
 
 # parsers
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10/100 Training')
@@ -51,6 +109,9 @@ parser.add_argument('--convkernel', default='8', type=int, help="parameter for c
 parser.add_argument('--dataset', default='cifar10', type=str, help='dataset to use (cifar10, cifar100, or imagenet100)')
 parser.add_argument('--train_dir', type=str, required=True, help='path to ImageNet-100 training data')
 parser.add_argument('--val_dir', type=str, required=True, help='path to ImageNet-100 validation data')
+parser.add_argument('--rho', default=0.05, type=float, help='SAM optimizer rho parameter')
+parser.add_argument('--alpha', default=10.0, type=float, help='Gradient regularization weight')
+parser.add_argument('--beta', default=1.0, type=float, help='Adversarial example weight')
 
 args = parser.parse_args()
 
@@ -311,48 +372,254 @@ if args.resume:
 # Loss is CE
 criterion = nn.CrossEntropyLoss()
 
-if args.opt == "adam":
-    optimizer = optim.Adam(net.parameters(), lr=args.lr)
-elif args.opt == "sgd":
-    optimizer = optim.SGD(net.parameters(), lr=args.lr)  
-    
+base_optimizer = optim.Adam(net.parameters(), lr=args.lr)
+optimizer = SAM(net.parameters(), base_optimizer, rho=0.05)
+
 # use cosine scheduling
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.n_epochs)
 
 ##### Training
 scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+# Add the padding sample generation function
+def gen_padding_images(X_batch, y_batch, batch_size):
+    """
+    Generate padding samples by interpolating between pairs of images and adding noise
+    Args:
+        X_batch: Input images tensor
+        y_batch: Input labels tensor
+        batch_size: Size of the batch
+    Returns:
+        X_pad: Padded images
+        y_pad: Labels for padded images (all set to 100)
+    """
+    # Convert to numpy for easier manipulation
+    X_np = X_batch.cpu().numpy()
+    y_np = y_batch.cpu().numpy()
+    
+    # Initialize arrays for padded samples
+    X_pad = [X_np[0]]  # Start with first image
+    y_pad = [y_np[0]]  # Start with first label
+    
+    # Generate padding samples
+    for i in range(len(X_np) - 1):
+        # Get two consecutive images
+        s = X_np[i]
+        t = X_np[i + 1]
+        
+        # Stack images for mean calculation
+        s_t = np.vstack((s, t))
+        
+        # Calculate mean
+        m = np.mean(s_t, axis=0)
+        
+        # Generate weighted average padding sample
+        alpha = 0.2
+        wa1 = np.average(s_t, axis=0, weights=[alpha, 1-alpha])
+        
+        # Add noise to weighted average
+        var = random.uniform(0.01, 0.1)
+        rand = np.random.normal(0, var, wa1.size)
+        rand = rand.reshape(wa1.shape)
+        wa1 = np.add(rand, wa1)
+        wa1 = np.clip(wa1, 0, 1)
+        
+        # Add weighted average sample
+        X_pad.append(wa1)
+        y_pad.append(100)  # Label as NOTA class
+        
+        # Generate mean-based noise sample
+        var = random.uniform(0.01, 0.1)
+        rand = np.random.normal(0, var, m.size)
+        rand = rand.reshape(m.shape)
+        rand_pert = np.add(rand, m)
+        rand_pert = np.clip(rand_pert, 0, 1)
+        
+        # Add mean-based noise sample
+        X_pad.append(rand_pert)
+        y_pad.append(100)  # Label as NOTA class
+    
+    # Add one more benign sample to match size
+    X_pad.append(X_np[1])
+    y_pad.append(y_np[1])
+    
+    # Convert to numpy arrays and reshape
+    X_pad = np.array(X_pad)
+    y_pad = np.array(y_pad)
+    
+    # Reshape to match input dimensions
+    if len(X_pad.shape) == 3:  # If input was 2D (flattened)
+        X_pad = X_pad.reshape(X_pad.shape[0], 32, 32, 3)
+    
+    # Convert back to tensors
+    X_pad = torch.FloatTensor(X_pad).to(X_batch.device)
+    y_pad = torch.LongTensor(y_pad).to(y_batch.device)
+    
+    return X_pad, y_pad
+
+# Add these functions before the train() function
+def random_batch(X, y, batch_size):
+    idx = np.random.randint(X.shape[0], size=batch_size)
+    return X[idx], y[idx]
+
+
+def early_stopping(model, X_train, y_train, X_test, y_test, name):
+    num_test_samples = 30
+    
+    # Create ART classifier
+    classifier = PyTorchClassifier(
+        model=model,
+        loss=criterion,
+        optimizer=optimizer,
+        input_shape=(3, 224, 224),
+        nb_classes=101,  # 100 classes + 1 padding class
+        clip_values=(0, 1)
+    )
+    
+    # Generate adversarial examples
+    attack = CarliniLInfMethod(classifier=classifier, confidence=0, max_iter=10, targeted=False)
+    x_test_adv = attack.generate(x=X_test[:num_test_samples])
+    
+    # Get predictions
+    predictions = classifier.predict(x_test_adv)
+    y_pred = np.argmax(predictions, axis=1)
+    
+    # Calculate success rate
+    success = 0.0
+    for i in range(y_test[:num_test_samples].shape[0]):
+        if y_pred[i] != y_test[i] and y_pred[i] != 100:  # 100 is padding class
+            success += 1.0
+    sr = success/num_test_samples
+    
+    # Calculate accuracies
+    model.eval()
+    with torch.no_grad():
+        train_pred = model(torch.FloatTensor(X_train).to(device))
+        train_acc = accuracy_score(y_train, train_pred.argmax(dim=1).cpu().numpy())
+        
+        test_pred = model(torch.FloatTensor(X_test).to(device))
+        test_acc = accuracy_score(y_test, test_pred.argmax(dim=1).cpu().numpy())
+    
+    # Log results
+    print(f"Attack success: {sr}")
+    print(f"Train Accuracy: {train_acc}")
+    print(f"Test Accuracy: {test_acc}")
+    
+    with open(f"{name}.txt", "a") as f:
+        f.write(f"Attack success: {sr}\n")
+        f.write(f"Train Accuracy: {train_acc}\n")
+        f.write(f"Test Accuracy: {test_acc}\n")
+    
+    return sr, test_acc
+
+
+# Modify the training function to include PadNet defense
 def train(epoch):
     print('\nEpoch: %d' % epoch)
     net.train()
     train_loss = 0
     correct = 0
     total = 0
+    
+    # Hyperparameters
+    alpha = args.alpha  # Weight for gradient regularization
+    beta = args.beta    # Weight for adversarial examples
+    count = 0          # For learning rate scheduling
+    best_acc = 0       # For early stopping
+    best_sr = 1.0      # For attack success rate
+    
     for batch_idx, (inputs, targets) in enumerate(trainloader):
         inputs, targets = inputs.to(device), targets.to(device)
-        # Train with amp
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            outputs = net(inputs)
-            loss = criterion(outputs, targets)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad()
-
-        train_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
-
-        # Print some example predictions with class names (only for ImageNet-100)
-        if args.dataset == 'imagenet100' and batch_idx == 0:
-            print("\nExample predictions:")
-            for i in range(min(5, len(targets))):
-                true_class = classes[targets[i].item()]
-                pred_class = classes[predicted[i].item()]
-                print(f"True: {true_class} | Predicted: {pred_class}")
-
+        
+        # Generate padding samples
+        X_pad, y_pad = gen_padding_images(inputs, targets, inputs.size(0))
+        
+        # Combine original and padding samples
+        combined_inputs = torch.cat([inputs, X_pad], dim=0)
+        combined_targets = torch.cat([targets, y_pad], dim=0)
+        
+        # Add PGD Adversarial Examples if available
+        if hasattr(trainloader, 'pgd_adv'):
+            pgd_adv, pgd_targets = next(iter(trainloader.pgd_adv))
+            pgd_adv, pgd_targets = pgd_adv.to(device), pgd_targets.to(device)
+            combined_inputs = torch.cat([combined_inputs, pgd_adv], dim=0)
+            combined_targets = torch.cat([combined_targets, pgd_targets], dim=0)
+        
+        # Add Adaptive Adversarial Examples if available
+        if hasattr(trainloader, 'adapt_adv'):
+            adapt_adv, adapt_targets = next(iter(trainloader.adapt_adv))
+            adapt_adv, adapt_targets = adapt_adv.to(device), adapt_targets.to(device)
+            combined_inputs = torch.cat([combined_inputs, adapt_adv], dim=0)
+            combined_targets = torch.cat([combined_targets, adapt_targets], dim=0)
+        
+        # Shuffle the combined batch
+        indices = torch.randperm(combined_inputs.size(0))
+        combined_inputs = combined_inputs[indices]
+        combined_targets = combined_targets[indices]
+        
+        # First step: Compute adversarial gradient
+        combined_inputs.requires_grad_(True)
+        outputs = net(combined_inputs)
+        
+        # Create padding labels for gradient computation
+        pad_labels = torch.full((combined_inputs.size(0),), 100, device=device)
+        loss_pad = criterion(outputs, pad_labels)
+        
+        # Compute gradients for adversarial direction
+        grad = torch.autograd.grad(loss_pad, combined_inputs, create_graph=True)[0]
+        
+        # Second step: Main training step with SAM
+        def closure():
+            nonlocal combined_inputs, combined_targets, grad
+            outputs = net(combined_inputs)
+            loss = criterion(outputs, combined_targets)
+            
+            # Add gradient regularization term
+            grad_reg = torch.mean(torch.square(grad))
+            final_loss = loss + alpha * grad_reg
+            
+            return final_loss
+        
+        # SAM optimizer step
+        optimizer.step(closure)
+        
+        # Update statistics
+        with torch.no_grad():
+            outputs = net(combined_inputs)
+            loss = criterion(outputs, combined_targets)
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += combined_targets.size(0)
+            correct += predicted.eq(combined_targets).sum().item()
+        
+        # Print progress
         progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
             % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        
+        # Early stopping and learning rate scheduling
+        if batch_idx % 150 == 0:
+            # Evaluate on validation set
+            val_loss, val_acc = test(epoch)
+            
+            if val_acc > best_acc:
+                best_acc = val_acc
+                count = 0
+                # Save best model
+                state = {
+                    'net': net.state_dict(),
+                    'acc': val_acc,
+                    'epoch': epoch,
+                }
+                torch.save(state, f'./checkpoint/{args.net}-{args.dataset}-{args.patch}-best.t7')
+            else:
+                count += 1
+            
+            # Learning rate scheduling
+            if count == 10:
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] *= 0.5
+                count = 0
+    
     return train_loss/(batch_idx+1)
 
 ##### Validation
@@ -433,3 +700,6 @@ for epoch in range(start_epoch, args.n_epochs):
 # writeout wandb
 if usewandb:
     wandb.save("wandb_{}_{}.h5".format(args.net, args.dataset))
+
+
+

@@ -76,7 +76,7 @@ start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 # Data
 print('==> Preparing data..')
 if args.net=="vit_timm":
-    size = 384
+    size = 384 # Keep this as 384 for pretrained ViT
 elif args.dataset == 'imagenet100':
     size = 224  # ImageNet standard size
 else:
@@ -103,17 +103,17 @@ else:
     raise ValueError("Dataset must be either 'cifar10', 'cifar100', or 'imagenet100'")
 
 # Modify transforms for ImageNet-100
-if args.dataset == 'imagenet100':
+if args.dataset == 'imagenet100' or args.net == "vit_timm":
     transform_train = transforms.Compose([
-        transforms.RandomResizedCrop(224),  # ImageNet standard size
+        transforms.RandomResizedCrop(384 if args.net == "vit_timm" else 224),  # ImageNet standard size
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
 
     transform_test = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
+        transforms.Resize(384 if args.net == "vit_timm" else 256),
+        transforms.CenterCrop(384 if args.net == "vit_timm" else 224),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])

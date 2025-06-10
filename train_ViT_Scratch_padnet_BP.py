@@ -525,7 +525,7 @@ def early_stopping(model, X_train, y_train, X_test, y_test, name):
     return sr, test_acc
 
 
-# Modify the training function to include PadNet defense
+# Modify the training function to use standard loss
 def train(epoch):
     print('\nEpoch: %d' % epoch)
     net.train()
@@ -534,8 +534,6 @@ def train(epoch):
     total = 0
     
     # Hyperparameters
-    alpha = args.alpha  # Weight for gradient regularization
-    beta = args.beta    # Weight for adversarial examples
     count = 0          # For learning rate scheduling
     best_acc = 0       # For early stopping
     best_sr = 1.0      # For attack success rate
@@ -555,20 +553,8 @@ def train(epoch):
         combined_inputs = torch.cat([inputs, X_pad], dim=0)
         combined_targets = torch.cat([targets, y_pad], dim=0)
         
-        # First step: Compute adversarial gradient
-        combined_inputs.requires_grad_(True)
-        outputs = net(combined_inputs)
-        
-        # Create padding labels for gradient computation
-        pad_labels = torch.full((combined_inputs.size(0),), num_classes - 1, device=device)
-        loss_pad = criterion(outputs, pad_labels)
-        
-        # Compute gradients for adversarial direction
-        grad = torch.autograd.grad(loss_pad, combined_inputs, create_graph=True)[0]
-        
-        # Second step: Main training step with SAM
+        # Training step with SAM
         def closure():
-            nonlocal combined_inputs, combined_targets, grad
             # Zero out existing gradients
             optimizer.zero_grad()
             
@@ -576,13 +562,9 @@ def train(epoch):
             outputs = net(combined_inputs)
             loss = criterion(outputs, combined_targets)
             
-            # Add gradient regularization term with reduced weight
-            grad_reg = torch.mean(torch.square(grad))
-            final_loss = loss + alpha * grad_reg
-            
             # Compute gradients
-            final_loss.backward()
-            return final_loss
+            loss.backward()
+            return loss
         
         # SAM optimizer step
         optimizer.step(closure)

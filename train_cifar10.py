@@ -51,6 +51,7 @@ parser.add_argument('--convkernel', default='8', type=int, help="parameter for c
 parser.add_argument('--dataset', default='cifar10', type=str, help='dataset to use (cifar10, cifar100, or imagenet100)')
 parser.add_argument('--train_dir', type=str, required=True, help='path to ImageNet-100 training data')
 parser.add_argument('--val_dir', type=str, required=True, help='path to ImageNet-100 validation data')
+parser.add_argument('--checkpoint_dir', type=str, default='./checkpoint', help='directory to save model checkpoints')
 
 args = parser.parse_args()
 
@@ -148,8 +149,8 @@ else:
     testset = dataset_class(root='./data', train=False, download=True, transform=transform_test)
 
 # Adjust batch size for ImageNet-100
-if args.dataset == 'imagenet100':
-    bs = min(bs, 256)  # Limit batch size for ImageNet-100 due to larger images
+#if args.dataset == 'imagenet100':
+#    bs = min(bs, 256)  # Limit batch size for ImageNet-100 due to larger images
 
 trainloader = torch.utils.data.DataLoader(trainset, batch_size=bs, shuffle=True, num_workers=8)
 testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=8)
@@ -301,8 +302,14 @@ if 'cuda' in device:
 if args.resume:
     # Load checkpoint.
     print('==> Resuming from checkpoint..')
-    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-    checkpoint_path = './checkpoint/{}-{}-{}-ckpt.t7'.format(args.net, args.dataset, args.patch)
+    assert os.path.isdir(args.checkpoint_dir), f'Error: checkpoint directory {args.checkpoint_dir} not found!'
+    # Find the latest checkpoint file
+    checkpoint_files = [f for f in os.listdir(args.checkpoint_dir) if f.startswith(f'{args.net}-{args.dataset}-{args.patch}')]
+    if not checkpoint_files:
+        raise FileNotFoundError(f'No checkpoint files found in {args.checkpoint_dir}')
+    # Sort by accuracy in filename and get the latest
+    checkpoint_files.sort(key=lambda x: float(x.split('acc')[-1].split('.t7')[0]), reverse=True)
+    checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_files[0])
     checkpoint = torch.load(checkpoint_path)
     net.load_state_dict(checkpoint['net'])
     best_acc = checkpoint['acc']
@@ -387,9 +394,11 @@ def test(epoch):
             "acc": acc,
             "epoch": epoch,
         }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/{}-{}-{}-ckpt.t7'.format(args.net, args.dataset, args.patch))
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        # Format accuracy to 2 decimal places for filename
+        acc_str = f"{acc:.2f}".replace('.', '_')
+        checkpoint_path = os.path.join(args.checkpoint_dir, f'{args.net}-{args.dataset}-{args.patch}-acc{acc_str}.t7')
+        torch.save(state, checkpoint_path)
         best_acc = acc
     
     os.makedirs("log", exist_ok=True)
